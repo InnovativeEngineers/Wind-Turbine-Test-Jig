@@ -1,25 +1,31 @@
+
+
 // LIBRARIES //
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <HX711_ADC.h>
 #include <Adafruit_RGBLCDShield.h>
+#include <DebounceInput.h>
 
 // CONFIG FLAGS //
 #define DEBUG
-#define LCD
+//#define LCD
+//#define SD_CARD
 
 // CONFIGS
 const unsigned int BAUDRATE = 9600;
-const unsigned long DELAY = 5000;
+const unsigned long DELAY = 1000;
 const unsigned int READ_TIME = 1000;
+const unsigned int DEBOUNCE = 500;
+unsigned long LAST_UPDATE;
 
 // PIN ASSIGNMENTS //
 const byte MASTER_START_PIN = 7; // master button pin to start test
 const byte ANEMOMETER_PIN = A1; // analog input, linear range, wind-speed[m/s] = 20*input[V] - 7.6
 const byte LOAD_CELL_DOUT_PIN = 4; // digital pin used to read shifted data from Load Cell
 const byte LOAD_CELL_SCK_PIN = 5; //digital serial clock pin used to shift data from Load Cell
-const byte HALL_SENSOR_PIN = A3; // analog pin scanned constantly to time rpm of shaft
+const byte HALL_SENSOR_PIN = 2 ;//A3; // analog pin scanned constantly to time rpm of shaft
 const byte SD_CHIPSELECT_PIN = 10; // chipselect pin for datalogging to SD shield
 const byte SD_CHIP_ERROR_PIN = 11; // digital pin connected to SD error LED
 const byte SERIAL_ERROR_PIN = 12; // digital pin connected to Serial error LED
@@ -47,9 +53,10 @@ const unsigned int LOAD_CELL_STABALIZING_TIME = 2000;
 const float LOAD_CELL_CAL_FACTOR = 18.75;
 
 // DATALOGGER
+#ifdef SD_CARD
 File DATAFILE;
 String FILENAME;
-unsigned long LAST_UPDATE;
+#endif
 
 // LCD (optional)
 #ifdef LCD
@@ -58,6 +65,8 @@ bool LCD_STATUS = true;
 const byte LCD_ON = 0xF;
 const byte LCD_OFF = 0;
 #endif
+
+DebouncedInput pin;
 
 // SETUP
 void setup() {
@@ -73,18 +82,19 @@ void setup() {
     Serial.begin(BAUDRATE);
   }
   #endif
-
+  
   #ifdef LCD
   lcd.begin(16,2);
   lcd.setBacklight(LCD_ON);
   lcd.clear();
   print_lines("INITIALIZING", "BUTTONS & PINS");
   #endif
-
+  
   init_buffers();
 
   pinMode(ANEMOMETER_PIN, INPUT);
-  pinMode(HALL_SENSOR_PIN, INPUT);
+  pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
+  pin.attach(HALL_SENSOR_PIN);
   
   pinMode(SD_CHIP_ERROR_PIN, OUTPUT);
   pinMode(SERIAL_ERROR_PIN, OUTPUT);
@@ -93,17 +103,19 @@ void setup() {
   print_lines("INITIALIZATION", "COMPLETE!");
   print_lines("CALIBRATING", "LOAD CELL");
   #endif
-
+  
   LoadCell.begin();
   LoadCell.start(LOAD_CELL_STABALIZING_TIME);
   LoadCell.setCalFactor(LOAD_CELL_CAL_FACTOR);
   LoadCell.tare();
-
+ 
   #ifdef LCD
   print_lines("CALIBRATION", "COMPLETE");
   print_lines("BOOTING", "DATALOGGER");
   #endif
-    
+
+
+  #ifdef SD_CARD
   if(!SD.begin(SD_CHIPSELECT_PIN)){
     #ifdef LCD
     print_lines("ERROR OPENING", "SD CARD");
@@ -114,12 +126,14 @@ void setup() {
       error = !error;
     }
   }
-
+  #endif
+  
   #ifdef LCD
   print_lines("BOOT COMPLETE", "SD CARD FOUND!");
   print_lines("FINDING OPEN", "FILENAME");
   #endif
 
+  #ifdef SD_CARD
   FILENAME = find_open_filename();
   if(SD.exists(FILENAME)){
       randomSeed(analogRead(0));
@@ -127,12 +141,15 @@ void setup() {
       FILENAME.setCharAt(5, (rand_num/100)%10);
       FILENAME.setCharAt(6, (rand_num/10)%10);
       FILENAME.setCharAt(7, (rand_num)%10);
-    }
-
+  }
+  #endif
+  
+  
   #ifdef LCD
   print_lines("OPENING FILE:", FILENAME);
   #endif
-  
+
+  #ifdef SD_CARD
   DATAFILE = SD.open(FILENAME, FILE_WRITE);
   if(!DATAFILE){
     #ifdef LCD
@@ -145,12 +162,13 @@ void setup() {
       DATAFILE = SD.open(FILENAME, FILE_WRITE);
     }
   }
-
+  #endif
+  
   #ifdef LCD
   print_lines("FILE CREATED:", FILENAME);
   #endif
 
-  #ifndef LCD
+  /*#ifndef LCD
   while(!digitalRead(MASTER_START_PIN));
   #endif
 
@@ -162,8 +180,8 @@ void setup() {
   lcd.print("TO START TEST...");
   while(!lcd.readButtons()||!digitalRead(MASTER_START_PIN));
   lcd.clear();
-  #endif
-
+  #endif*/
+  
   LAST_UPDATE = millis();
 
   attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), read_hall_sensor, RISING);
@@ -174,6 +192,8 @@ void loop() {
   
  read_anemometer();
  read_load_cell();
+ LoadCell.update();
+ 
 
  if(millis()-LAST_UPDATE > DELAY){
 
@@ -190,12 +210,13 @@ void loop() {
   }
   #endif
   
-  detachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN));
+  //detachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN));
   
   float v = velocity();
-  float f = force();
+  double f = force();
   float w = omega();
   
+  #ifdef SD_CARD
   DATAFILE.print(v);
   DATAFILE.print(',');
   DATAFILE.print(f);
@@ -206,6 +227,7 @@ void loop() {
   DATAFILE.print(millis());
   #endif
   DATAFILE.print('\n');
+  #endif
   
   #ifdef LCD
   lcd.clear();
@@ -238,6 +260,7 @@ void loop() {
   
   attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), read_hall_sensor, RISING);
  }
+ delay(50);
 }
 
 void init_buffers(){
@@ -294,9 +317,15 @@ double force(){
 }
 
 void read_hall_sensor(){
-  HALL_SENSOR_BUFFER[HALL_SENSOR_INDEX++] = millis() - HALL_SENSOR_TIME;
-  HALL_SENSOR_INDEX %= BUFFER_SIZE;
-  HALL_SENSOR_TIME = millis();
+  unsigned long now = millis();
+  if(now-HALL_SENSOR_TIME > DEBOUNCE)
+  {
+      HALL_SENSOR_BUFFER[HALL_SENSOR_INDEX++] = millis() - HALL_SENSOR_TIME;
+      HALL_SENSOR_INDEX %= BUFFER_SIZE;
+      HALL_SENSOR_TIME = millis();
+      Serial.print("INT");
+  }
+  
 }
 
 double omega(){
@@ -319,4 +348,3 @@ void print_lines(String line_1, String line_2){
   delay(READ_TIME);
 }
 #endif
-
